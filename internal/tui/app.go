@@ -145,44 +145,44 @@ func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	keyStr := msg.String()
 
 	switch keyStr {
-	// Alt+Left - previous tab
-	case "alt+left", "alt+[1;3D":
+	// Ctrl+Left - previous tab
+	case "ctrl+left", "ctrl+b":
 		if m.activeTab > 0 {
 			m.activeTab--
 		}
 		return m, nil
 
-	// Alt+Right - next tab
-	case "alt+right", "alt+[1;3C":
+	// Ctrl+Right - next tab
+	case "ctrl+right", "ctrl+f":
 		if m.activeTab < len(m.tabs)-1 {
 			m.activeTab++
 		}
 		return m, nil
 
-	// Alt+N - new agent
-	case "alt+n":
+	// Ctrl+N - new agent
+	case "ctrl+n":
 		m.inputMode = true
 		m.inputPrompt = "Task description: "
 		m.inputBuffer = ""
 		m.inputAction = m.createNewAgent
 		return m, nil
 
-	// Alt+W - close tab
-	case "alt+w":
+	// Ctrl+W - close tab
+	case "ctrl+w":
 		if m.activeTab > 0 { // Don't close main tab
 			return m.closeCurrentTab()
 		}
 		return m, nil
 
-	// Alt+M - merge current tab
-	case "alt+m":
+	// Ctrl+M - merge current tab (note: ctrl+m = enter in some terminals, use ctrl+g as backup)
+	case "ctrl+g":
 		if m.activeTab > 0 {
 			return m.mergeCurrentTab()
 		}
 		return m, nil
 
-	// Alt+Q or Ctrl+C - quit
-	case "alt+q", "ctrl+c":
+	// Ctrl+Q - quit
+	case "ctrl+q", "ctrl+c":
 		m.quitting = true
 		m.ptyManager.StopAll()
 		return m, tea.Quit
@@ -237,18 +237,14 @@ func keyToBytes(msg tea.KeyMsg) []byte {
 		return []byte{27, '[', '3', '~'}
 	case tea.KeyCtrlA:
 		return []byte{1}
-	case tea.KeyCtrlB:
-		return []byte{2}
-	case tea.KeyCtrlC:
-		return []byte{3}
+	// KeyCtrlB used for prev tab - don't forward
+	// KeyCtrlC handled by quit
 	case tea.KeyCtrlD:
 		return []byte{4}
 	case tea.KeyCtrlE:
 		return []byte{5}
-	case tea.KeyCtrlF:
-		return []byte{6}
-	case tea.KeyCtrlG:
-		return []byte{7}
+	// KeyCtrlF used for next tab - don't forward
+	// KeyCtrlG used for merge - don't forward
 	case tea.KeyCtrlH:
 		return []byte{8}
 	// KeyCtrlI is same as KeyTab, handled above
@@ -258,12 +254,12 @@ func keyToBytes(msg tea.KeyMsg) []byte {
 		return []byte{11}
 	case tea.KeyCtrlL:
 		return []byte{12}
-	case tea.KeyCtrlN:
-		return []byte{14}
+	// KeyCtrlN used for new agent - don't forward
 	case tea.KeyCtrlO:
 		return []byte{15}
 	case tea.KeyCtrlP:
 		return []byte{16}
+	// KeyCtrlQ used for quit - don't forward
 	case tea.KeyCtrlR:
 		return []byte{18}
 	case tea.KeyCtrlS:
@@ -274,8 +270,7 @@ func keyToBytes(msg tea.KeyMsg) []byte {
 		return []byte{21}
 	case tea.KeyCtrlV:
 		return []byte{22}
-	case tea.KeyCtrlW:
-		return []byte{23}
+	// KeyCtrlW used for close tab - don't forward
 	case tea.KeyCtrlX:
 		return []byte{24}
 	case tea.KeyCtrlY:
@@ -518,6 +513,6 @@ func (m Model) renderStatusBar() string {
 	}
 
 	// Show keybinds
-	help := " ⌥← Prev │ ⌥→ Next │ ⌥N New │ ⌥M Merge │ ⌥W Close │ ⌥Q Quit"
+	help := " ^B Prev │ ^F Next │ ^N New │ ^G Merge │ ^W Close │ ^Q Quit"
 	return statusStyle.Render(help)
 }
