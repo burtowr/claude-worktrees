@@ -1,0 +1,9 @@
+{
+  "name": "cwt",
+  "version": "1.0.0",
+  "description": "Claude Worktree Agents - Merge orchestration and status commands",
+  "author": {
+    "name": "wburton"
+  },
+  "keywords": ["worktree", "parallel", "agents", "merge"]
+}
