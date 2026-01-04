@@ -84,7 +84,7 @@ func (m *Manager) Write(id string, data []byte) (int, error) {
 }
 
 // ResizeAll resizes all sessions
-func (m *Manager) ResizeAll(rows, cols uint16) {
+func (m *Manager) ResizeAll(rows, cols int) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 

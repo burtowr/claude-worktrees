@@ -22,24 +22,18 @@ type Tab struct {
 
 // Model is the main bubbletea model
 type Model struct {
-	tabs         []Tab
-	activeTab    int
-	ptyManager   *pty.Manager
-	wtManager    *worktree.Manager
-	width        int
-	height       int
-	inputMode    bool
-	inputBuffer  string
-	inputPrompt  string
-	inputAction  func(string)
-	quitting     bool
-	lastOutput   map[string]string // Cache last output per session
-}
-
-// OutputMsg is sent when PTY output is received
-type OutputMsg struct {
-	SessionID string
-	Data      []byte
+	tabs        []Tab
+	activeTab   int
+	ptyManager  *pty.Manager
+	wtManager   *worktree.Manager
+	width       int
+	height      int
+	inputMode   bool
+	inputBuffer string
+	inputPrompt string
+	inputAction func(string)
+	quitting    bool
+	ready       bool
 }
 
 // NewModel creates a new TUI model
@@ -54,19 +48,15 @@ func NewModel(repoRoot string) (*Model, error) {
 		activeTab:  0,
 		ptyManager: pty.NewManager(),
 		wtManager:  wtManager,
-		lastOutput: make(map[string]string),
+		width:      80,
+		height:     24,
 	}
 
 	// Create main tab
-	mainSession, err := m.ptyManager.Spawn("main", repoRoot, "Main orchestrator")
+	_, err = m.ptyManager.Spawn("main", repoRoot, "Main orchestrator")
 	if err != nil {
 		return nil, fmt.Errorf("failed to spawn main session: %w", err)
 	}
-
-	// Set up output callback
-	mainSession.SetOutputCallback(func(data []byte) {
-		// This will trigger a view update
-	})
 
 	m.tabs = append(m.tabs, Tab{
 		ID:        "main",
@@ -78,11 +68,10 @@ func NewModel(repoRoot string) (*Model, error) {
 	// Restore existing agents
 	for _, agent := range wtManager.ListAgents() {
 		if agent.Status == worktree.StatusRunning {
-			session, err := m.ptyManager.Spawn(agent.ID, agent.Worktree, agent.Task)
+			_, err := m.ptyManager.Spawn(agent.ID, agent.Worktree, agent.Task)
 			if err != nil {
 				continue // Skip failed sessions
 			}
-			session.SetOutputCallback(func(data []byte) {})
 
 			m.tabs = append(m.tabs, Tab{
 				ID:        agent.ID,
@@ -107,14 +96,13 @@ func truncate(s string, max int) string {
 // Init implements bubbletea.Model
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
-		tea.EnterAltScreen,
 		tickCmd(),
 	)
 }
 
 // tickCmd creates a tick command for periodic updates
 func tickCmd() tea.Cmd {
-	return tea.Tick(100*time.Millisecond, func(_ time.Time) tea.Msg {
+	return tea.Tick(50*time.Millisecond, func(_ time.Time) tea.Msg {
 		return tickMsg{}
 	})
 }
@@ -130,84 +118,176 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		// Resize all PTY sessions
-		m.ptyManager.ResizeAll(uint16(m.height-3), uint16(m.width))
+		m.ready = true
+		// Resize all PTY sessions (account for tab bar and status bar)
+		termHeight := m.height - 2
+		if termHeight < 1 {
+			termHeight = 1
+		}
+		m.ptyManager.ResizeAll(termHeight, m.width)
 		return m, nil
 
 	case tickMsg:
-		// Update output caches
-		for _, tab := range m.tabs {
-			if session, ok := m.ptyManager.Get(tab.SessionID); ok {
-				m.lastOutput[tab.SessionID] = session.Output()
-			}
-		}
+		// Just trigger redraw
 		return m, tickCmd()
-
-	case OutputMsg:
-		// Output received, view will update
-		return m, nil
 	}
 
 	return m, nil
 }
 
 func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// Handle input mode
+	// Handle input mode first
 	if m.inputMode {
 		return m.handleInputMode(msg)
 	}
 
-	switch msg.String() {
-	// Cmd+Left (Option+Left on macOS terminal) - previous tab
-	case "alt+left", "shift+left":
+	// Check for our control keys
+	keyStr := msg.String()
+
+	switch keyStr {
+	// Alt+Left - previous tab
+	case "alt+left", "alt+[1;3D":
 		if m.activeTab > 0 {
 			m.activeTab--
 		}
 		return m, nil
 
-	// Cmd+Right - next tab
-	case "alt+right", "shift+right":
+	// Alt+Right - next tab
+	case "alt+right", "alt+[1;3C":
 		if m.activeTab < len(m.tabs)-1 {
 			m.activeTab++
 		}
 		return m, nil
 
-	// Cmd+N - new agent
-	case "alt+n", "ctrl+n":
+	// Alt+N - new agent
+	case "alt+n":
 		m.inputMode = true
 		m.inputPrompt = "Task description: "
 		m.inputBuffer = ""
 		m.inputAction = m.createNewAgent
 		return m, nil
 
-	// Cmd+W - close tab
-	case "alt+w", "ctrl+w":
+	// Alt+W - close tab
+	case "alt+w":
 		if m.activeTab > 0 { // Don't close main tab
 			return m.closeCurrentTab()
 		}
 		return m, nil
 
-	// Cmd+M - merge current tab
-	case "alt+m", "ctrl+m":
+	// Alt+M - merge current tab
+	case "alt+m":
 		if m.activeTab > 0 {
 			return m.mergeCurrentTab()
 		}
 		return m, nil
 
-	// Cmd+Q - quit
-	case "alt+q", "ctrl+q", "ctrl+c":
+	// Alt+Q or Ctrl+C - quit
+	case "alt+q", "ctrl+c":
 		m.quitting = true
 		m.ptyManager.StopAll()
 		return m, tea.Quit
+	}
 
-	// Forward other keys to active session
-	default:
-		if tab := m.currentTab(); tab != nil {
-			if session, ok := m.ptyManager.Get(tab.SessionID); ok {
-				session.Write([]byte(msg.String()))
+	// Forward to active session
+	if tab := m.currentTab(); tab != nil {
+		if session, ok := m.ptyManager.Get(tab.SessionID); ok {
+			// Convert key message to bytes
+			data := keyToBytes(msg)
+			if len(data) > 0 {
+				session.Write(data)
 			}
 		}
-		return m, nil
+	}
+
+	return m, nil
+}
+
+// keyToBytes converts a tea.KeyMsg to the bytes that should be sent to PTY
+func keyToBytes(msg tea.KeyMsg) []byte {
+	switch msg.Type {
+	case tea.KeyRunes:
+		return []byte(string(msg.Runes))
+	case tea.KeyEnter:
+		return []byte{'\r'}
+	case tea.KeyBackspace:
+		return []byte{127}
+	case tea.KeyTab:
+		return []byte{'\t'}
+	case tea.KeySpace:
+		return []byte{' '}
+	case tea.KeyEscape:
+		return []byte{27}
+	case tea.KeyUp:
+		return []byte{27, '[', 'A'}
+	case tea.KeyDown:
+		return []byte{27, '[', 'B'}
+	case tea.KeyRight:
+		return []byte{27, '[', 'C'}
+	case tea.KeyLeft:
+		return []byte{27, '[', 'D'}
+	case tea.KeyHome:
+		return []byte{27, '[', 'H'}
+	case tea.KeyEnd:
+		return []byte{27, '[', 'F'}
+	case tea.KeyPgUp:
+		return []byte{27, '[', '5', '~'}
+	case tea.KeyPgDown:
+		return []byte{27, '[', '6', '~'}
+	case tea.KeyDelete:
+		return []byte{27, '[', '3', '~'}
+	case tea.KeyCtrlA:
+		return []byte{1}
+	case tea.KeyCtrlB:
+		return []byte{2}
+	case tea.KeyCtrlC:
+		return []byte{3}
+	case tea.KeyCtrlD:
+		return []byte{4}
+	case tea.KeyCtrlE:
+		return []byte{5}
+	case tea.KeyCtrlF:
+		return []byte{6}
+	case tea.KeyCtrlG:
+		return []byte{7}
+	case tea.KeyCtrlH:
+		return []byte{8}
+	// KeyCtrlI is same as KeyTab, handled above
+	case tea.KeyCtrlJ:
+		return []byte{10}
+	case tea.KeyCtrlK:
+		return []byte{11}
+	case tea.KeyCtrlL:
+		return []byte{12}
+	case tea.KeyCtrlN:
+		return []byte{14}
+	case tea.KeyCtrlO:
+		return []byte{15}
+	case tea.KeyCtrlP:
+		return []byte{16}
+	case tea.KeyCtrlR:
+		return []byte{18}
+	case tea.KeyCtrlS:
+		return []byte{19}
+	case tea.KeyCtrlT:
+		return []byte{20}
+	case tea.KeyCtrlU:
+		return []byte{21}
+	case tea.KeyCtrlV:
+		return []byte{22}
+	case tea.KeyCtrlW:
+		return []byte{23}
+	case tea.KeyCtrlX:
+		return []byte{24}
+	case tea.KeyCtrlY:
+		return []byte{25}
+	case tea.KeyCtrlZ:
+		return []byte{26}
+	default:
+		// For unknown keys, try the string representation
+		if s := msg.String(); len(s) == 1 {
+			return []byte(s)
+		}
+		return nil
 	}
 }
 
@@ -221,7 +301,7 @@ func (m Model) handleInputMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.inputBuffer = ""
 		return m, nil
 
-	case tea.KeyEsc:
+	case tea.KeyEscape:
 		m.inputMode = false
 		m.inputBuffer = ""
 		return m, nil
@@ -232,12 +312,16 @@ func (m Model) handleInputMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	default:
-		if msg.Type == tea.KeyRunes {
-			m.inputBuffer += string(msg.Runes)
-		}
+	case tea.KeyRunes:
+		m.inputBuffer += string(msg.Runes)
+		return m, nil
+
+	case tea.KeySpace:
+		m.inputBuffer += " "
 		return m, nil
 	}
+
+	return m, nil
 }
 
 func (m *Model) createNewAgent(task string) {
@@ -247,13 +331,21 @@ func (m *Model) createNewAgent(task string) {
 		return
 	}
 
-	session, err := m.ptyManager.Spawn(agent.ID, agent.Worktree, agent.Task)
+	_, err = m.ptyManager.Spawn(agent.ID, agent.Worktree, agent.Task)
 	if err != nil {
 		// Clean up worktree on failure
 		m.wtManager.RemoveWorktree(agent.ID)
 		return
 	}
-	session.SetOutputCallback(func(data []byte) {})
+
+	// Resize the new session
+	termHeight := m.height - 2
+	if termHeight < 1 {
+		termHeight = 1
+	}
+	if session, ok := m.ptyManager.Get(agent.ID); ok {
+		session.Resize(termHeight, m.width)
+	}
 
 	m.tabs = append(m.tabs, Tab{
 		ID:        agent.ID,
@@ -321,19 +413,23 @@ func (m Model) View() string {
 		return "Goodbye!\n"
 	}
 
-	var s strings.Builder
+	if !m.ready {
+		return "Initializing..."
+	}
+
+	var b strings.Builder
 
 	// Tab bar
-	s.WriteString(m.renderTabBar())
-	s.WriteString("\n")
+	b.WriteString(m.renderTabBar())
+	b.WriteString("\n")
 
-	// Session output
-	s.WriteString(m.renderSession())
+	// Session output (takes remaining space)
+	b.WriteString(m.renderSession())
 
 	// Status bar / Input
-	s.WriteString(m.renderStatusBar())
+	b.WriteString(m.renderStatusBar())
 
-	return s.String()
+	return b.String()
 }
 
 func (m Model) renderTabBar() string {
@@ -363,31 +459,49 @@ func (m Model) renderTabBar() string {
 		}
 	}
 
-	return lipgloss.JoinHorizontal(lipgloss.Top, tabs...)
+	// Fill remaining space with background
+	tabBar := lipgloss.JoinHorizontal(lipgloss.Top, tabs...)
+	return lipgloss.NewStyle().
+		Width(m.width).
+		Background(lipgloss.Color("236")).
+		Render(tabBar)
 }
 
 func (m Model) renderSession() string {
-	height := m.height - 3 // Account for tab bar and status bar
-	if height < 1 {
-		height = 1
+	termHeight := m.height - 2 // Tab bar + status bar
+	if termHeight < 1 {
+		termHeight = 1
 	}
 
 	tab := m.currentTab()
 	if tab == nil {
-		return ""
+		return strings.Repeat("\n", termHeight)
 	}
 
-	output := m.lastOutput[tab.SessionID]
+	session, ok := m.ptyManager.Get(tab.SessionID)
+	if !ok {
+		return strings.Repeat("\n", termHeight)
+	}
 
-	// Get last N lines that fit the screen
+	// Get the virtual terminal output
+	output := session.Output()
+
+	// Split into lines and take last termHeight lines
 	lines := strings.Split(output, "\n")
-	if len(lines) > height {
-		lines = lines[len(lines)-height:]
+
+	// Ensure we have exactly termHeight lines
+	if len(lines) > termHeight {
+		lines = lines[len(lines)-termHeight:]
+	}
+	for len(lines) < termHeight {
+		lines = append(lines, "")
 	}
 
-	// Pad to fill height
-	for len(lines) < height {
-		lines = append(lines, "")
+	// Truncate lines that are too long
+	for i, line := range lines {
+		if len(line) > m.width {
+			lines[i] = line[:m.width]
+		}
 	}
 
 	return strings.Join(lines, "\n") + "\n"
@@ -404,6 +518,6 @@ func (m Model) renderStatusBar() string {
 	}
 
 	// Show keybinds
-	help := "  ⌥← Prev Tab │ ⌥→ Next Tab │ ⌥N New │ ⌥M Merge │ ⌥W Close │ ⌥Q Quit"
+	help := " ⌥← Prev │ ⌥→ Next │ ⌥N New │ ⌥M Merge │ ⌥W Close │ ⌥Q Quit"
 	return statusStyle.Render(help)
 }

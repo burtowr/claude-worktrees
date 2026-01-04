@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/creack/pty"
+	"github.com/hinshun/vt10x"
 )
 
 // Session represents a single PTY session running Claude Code
@@ -14,63 +15,13 @@ type Session struct {
 	ID       string
 	Workdir  string
 	Task     string
-	pty      *os.File
+	ptmx     *os.File
 	cmd      *exec.Cmd
-	buffer   *RingBuffer
+	term     vt10x.Terminal
 	mu       sync.RWMutex
 	done     chan struct{}
-	onOutput func([]byte)
-}
-
-// RingBuffer is a fixed-size circular buffer for terminal output
-type RingBuffer struct {
-	data  []byte
-	size  int
-	start int
-	len   int
-	mu    sync.RWMutex
-}
-
-// NewRingBuffer creates a new ring buffer with the given size
-func NewRingBuffer(size int) *RingBuffer {
-	return &RingBuffer{
-		data: make([]byte, size),
-		size: size,
-	}
-}
-
-// Write appends data to the ring buffer
-func (r *RingBuffer) Write(p []byte) (n int, err error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	for _, b := range p {
-		pos := (r.start + r.len) % r.size
-		r.data[pos] = b
-		if r.len < r.size {
-			r.len++
-		} else {
-			r.start = (r.start + 1) % r.size
-		}
-	}
-	return len(p), nil
-}
-
-// Bytes returns the current buffer contents
-func (r *RingBuffer) Bytes() []byte {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	result := make([]byte, r.len)
-	for i := 0; i < r.len; i++ {
-		result[i] = r.data[(r.start+i)%r.size]
-	}
-	return result
-}
-
-// String returns the buffer contents as a string
-func (r *RingBuffer) String() string {
-	return string(r.Bytes())
+	rows     int
+	cols     int
 }
 
 // NewSession creates a new PTY session
@@ -79,8 +30,9 @@ func NewSession(id, workdir, task string) *Session {
 		ID:      id,
 		Workdir: workdir,
 		Task:    task,
-		buffer:  NewRingBuffer(1024 * 1024), // 1MB buffer
 		done:    make(chan struct{}),
+		rows:    24,
+		cols:    80,
 	}
 }
 
@@ -89,31 +41,37 @@ func (s *Session) Start() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Create virtual terminal
+	s.term = vt10x.New(vt10x.WithSize(s.cols, s.rows))
+
 	cmd := exec.Command("claude")
 	cmd.Dir = s.Workdir
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 
-	ptmx, err := pty.Start(cmd)
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{
+		Rows: uint16(s.rows),
+		Cols: uint16(s.cols),
+	})
 	if err != nil {
 		return err
 	}
 
 	s.cmd = cmd
-	s.pty = ptmx
+	s.ptmx = ptmx
 
-	// Start reading from PTY
+	// Start reading from PTY into virtual terminal
 	go s.readLoop()
 
 	return nil
 }
 
-// readLoop continuously reads from the PTY and writes to the buffer
+// readLoop continuously reads from the PTY and writes to the virtual terminal
 func (s *Session) readLoop() {
 	defer close(s.done)
 
 	buf := make([]byte, 4096)
 	for {
-		n, err := s.pty.Read(buf)
+		n, err := s.ptmx.Read(buf)
 		if err != nil {
 			if err != io.EOF {
 				// Log error but don't crash
@@ -121,10 +79,9 @@ func (s *Session) readLoop() {
 			return
 		}
 		if n > 0 {
-			s.buffer.Write(buf[:n])
-			if s.onOutput != nil {
-				s.onOutput(buf[:n])
-			}
+			s.mu.Lock()
+			s.term.Write(buf[:n])
+			s.mu.Unlock()
 		}
 	}
 }
@@ -134,36 +91,48 @@ func (s *Session) Write(data []byte) (int, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if s.pty == nil {
+	if s.ptmx == nil {
 		return 0, io.ErrClosedPipe
 	}
-	return s.pty.Write(data)
+	return s.ptmx.Write(data)
 }
 
-// Output returns the current buffer contents
+// WriteString sends a string to the PTY
+func (s *Session) WriteString(str string) (int, error) {
+	return s.Write([]byte(str))
+}
+
+// Output returns the current terminal screen as a string
 func (s *Session) Output() string {
-	return s.buffer.String()
-}
-
-// SetOutputCallback sets a callback for when new output arrives
-func (s *Session) SetOutputCallback(cb func([]byte)) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.onOutput = cb
-}
-
-// Resize resizes the PTY
-func (s *Session) Resize(rows, cols uint16) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if s.pty == nil {
-		return nil
+	if s.term == nil {
+		return ""
 	}
-	return pty.Setsize(s.pty, &pty.Winsize{
-		Rows: rows,
-		Cols: cols,
-	})
+
+	return s.term.String()
+}
+
+// Resize resizes the PTY and virtual terminal
+func (s *Session) Resize(rows, cols int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.rows = rows
+	s.cols = cols
+
+	if s.term != nil {
+		s.term.Resize(cols, rows)
+	}
+
+	if s.ptmx != nil {
+		return pty.Setsize(s.ptmx, &pty.Winsize{
+			Rows: uint16(rows),
+			Cols: uint16(cols),
+		})
+	}
+	return nil
 }
 
 // Stop terminates the session
@@ -171,8 +140,8 @@ func (s *Session) Stop() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.pty != nil {
-		s.pty.Close()
+	if s.ptmx != nil {
+		s.ptmx.Close()
 	}
 	if s.cmd != nil && s.cmd.Process != nil {
 		s.cmd.Process.Kill()
@@ -193,4 +162,18 @@ func (s *Session) IsRunning() bool {
 	default:
 		return true
 	}
+}
+
+// Rows returns current row count
+func (s *Session) Rows() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.rows
+}
+
+// Cols returns current column count
+func (s *Session) Cols() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cols
 }
