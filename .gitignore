@@ -1,0 +1,15 @@
+# CWT runtime files
+.worktrees/
+.cwt/
+
+# Go binaries
+cwt
+*.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
