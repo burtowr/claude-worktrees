@@ -19,6 +19,7 @@ pub enum AgentStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Agent {
     pub id: String,
     pub branch: String,
@@ -28,10 +29,12 @@ pub struct Agent {
     pub base_branch: String,
     pub base_commit: String,
     pub created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub merged_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct State {
     pub version: String,
     pub repo_root: PathBuf,
