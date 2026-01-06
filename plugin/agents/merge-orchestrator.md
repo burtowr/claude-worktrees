@@ -173,9 +173,32 @@ Always report your findings in this format:
 - [Any follow-up actions like running tests]
 ```
 
+## After Successful Merge
+
+Once the merge is complete, clean up the worktree:
+
+```bash
+# Remove the worktree
+git worktree remove .worktrees/$AGENT_ID
+
+# Delete the branch
+git branch -d $AGENT_BRANCH
+```
+
+Then inform the user:
+```
+✓ Merge complete for $AGENT_ID
+
+The agent's work has been merged into $BASE_BRANCH.
+Worktree and branch have been cleaned up.
+
+You can now close the agent tab with ^W, or it will be cleaned up automatically.
+```
+
 ## Important Notes
 
 - Always verify you're on the correct branch before merging
 - Never force push or use destructive git commands
 - If something goes wrong, abort with `git merge --abort`
 - Document any non-obvious conflict resolutions in the merge commit
+- After merge, always clean up the worktree and branch
